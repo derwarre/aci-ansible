@@ -1,0 +1,252 @@
+#!/usr/bin/env python
+
+# Copyright 2015 Jason Edelman <jedelman8@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_bridge_domain
+short_description: Manage bridge domains in an ACI fabric
+description:
+    - Manages bridge domains within an ACI fabric
+author: Jason Edelman (@jedelman8)
+requirements:
+    - check version requirements ==============================================
+    - Cobra SDK version =======================================================
+notes:
+    - Tenant and context must be exist prior to using this module
+    - One subnet can be added per task (per module call)
+    - state=absent removes complete bridge domain configuration
+options:
+    name:
+        description:
+            - Name of context (private network)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of bridge domain
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    tenant:
+        description:
+            - name of tenant this bridge domain will be part of
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    subnet:
+        description:
+            - name of subnet that is paired to bridge domain
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    context:
+        description:
+            - name of context (private network)
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the feature
+        required: true
+        default: null
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC (resolvable by Ansible control host)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol to use for NX-API
+        required: false
+        default: http
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure bridge domain exists
+- aci_bridge_domain: name=c1bd1 context=c1_priv_network subnet=10.1.100.1/24 descr='web servers' tenant=customer_1 state=present host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+# ensure bridge domain does not exist
+- aci_bridge_domain: name=c1bd1 context=c1_priv_network tenant=customer_1 state=absent host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+'''
+import socket
+
+from cobra.mit.access import MoDirectory
+from cobra.mit.session import LoginSession
+from cobra.mit.request import ConfigRequest
+from cobra.mit.naming import Dn
+from cobra.mit.request import DnQuery
+from cobra.model.fv import Tenant
+from cobra.model.fv import Ctx
+from cobra.model.fv import BD
+from cobra.model.fv import Subnet
+from cobra.model.fv import RsCtx
+from cobra.internal.codec.xmlcodec import toXMLStr
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            tenant=dict(type='str', required=True),
+            context=dict(type='str', required=True),
+            subnet=dict(type='str'),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], required=True),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    tenant = module.params['tenant']
+    descr = module.params['descr']
+    context = module.params['context']
+    subnet = module.params['subnet']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    tenant_mo = moDir.lookupByDn('uni/tn-{0}'.format(tenant))
+    if not tenant_mo:
+        print module.fail_json(msg='tenant needs to be created first')
+
+    context_mo = moDir.lookupByDn('uni/tn-{0}/ctx-{1}'.format(tenant, context))
+    if not context_mo:
+        print module.fail_json(msg='context needs to be created first')
+
+    bdname = None
+    bddescr = None
+    bdsubnet = None
+    existing_context = None
+    net_new = True
+
+    bd_mo = moDir.lookupByDn('uni/tn-{0}/BD-{1}'.format(tenant, name))
+
+    if bd_mo:
+        bdname = bd_mo.name
+        bddescr = bd_mo.descr
+        net_new = False
+
+        if subnet:
+            subnet_mo = moDir.lookupByDn('uni/tn-{0}/BD-{1}/subnet-[{2}]'.format(tenant, name, subnet))
+            if subnet_mo:
+                bdsubnet = subnet_mo.ip
+
+        existing_context = moDir.lookupByDn('uni/tn-{0}/BD-{1}/rsctx'.format(tenant, name)).tnFvCtxName
+
+    existing = dict(name=bdname, descr=bddescr, subnet=bdsubnet, context=existing_context)
+
+    args = dict(name=name, descr=descr, subnet=subnet, context=context)
+    proposed = {}
+    for key, value in args.iteritems():
+        if value:
+            proposed[key] = value
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    fvBD = None
+    if state == 'present':
+        if delta or net_new:
+            des = delta.get('descr', None)
+            fvBD = BD(tenant_mo, name=name, descr=des) if des else BD(tenant_mo, name=name)
+            to_subnet = delta.get('subnet', None) or existing['subnet']
+            if to_subnet:
+                fvSubnet = Subnet(fvBD, ip=to_subnet)
+            to_context = delta.get('context', None) or existing['context']
+            fvRsCtx = RsCtx(fvBD, tnFvCtxName=to_context)
+    elif state == 'absent':
+        if not net_new:
+            fvBD = BD(tenant_mo, name=name)
+            fvBD.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if fvBD:
+        xmldoc = toXMLStr(fvBD)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(fvBD)
+            moDir.commit(config_req)
+
+            bd_mo = moDir.lookupByDn('uni/tn-{0}/BD-{1}'.format(tenant, name))
+            if bd_mo:
+                bdname = bd_mo.name
+                bddescr = bd_mo.descr
+                if subnet:
+                    subnet_mo = moDir.lookupByDn('uni/tn-{0}/BD-{1}/subnet-[{2}]'.format(tenant, name, subnet))
+                    if subnet_mo:
+                        bdsubnet = subnet_mo.ip
+
+                results['new'] = dict(name=bdname, descr=bddescr, subnet=bdsubnet, context=existing_context)
+
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

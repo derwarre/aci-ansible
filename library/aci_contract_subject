@@ -1,0 +1,414 @@
+#!/usr/bin/env python
+
+# Copyright 2015 Jason Edelman <jedelman8@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_contract_subject
+short_description: Manages contract subjects
+description:
+    - Manages contract subjects that are a necessity for contracts
+author: Jason Edelman (@jedelman8)
+requirements:
+    - check version requirements ==============================================
+    - Cobra SDK version =======================================================
+notes:
+    - Tenant & Contract must be exist prior to using this module
+    - YAML syntax required within the playbook for this module
+    - QOS class per filter "group" when not applying the same group
+      in both directions is not yet supported
+    - Service graph coming soon!
+options:
+    name:
+        description:
+            - Name of contract subject
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of contract subject
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    contract:
+        description:
+            - Name of contract this subject will be applied to
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    tenant:
+        description:
+            - Name of tenant the contract and subject will be applied to
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    reverse_filter_ports:
+        description:
+            - Apply the same subject rule to the reverse filter ports when
+              the contract applies in both directions.  apply_both_directions must
+              be true to use this flag
+        required: false
+        default: null
+        choices: ['true', 'false', 'yes', 'no']
+        aliases: []
+    apply_both_directions:
+        description:
+            - determines if the contract applies to both inbound and outbound traffic
+        required: false
+        default: True
+        choices: ['true', 'false', 'yes', 'no']
+        aliases: []
+    prio:
+        description:
+            - priority (qos class) for subject (not per direction filters)
+        required: false
+        default: null
+        choices: ['unspecified', 'level1', 'level2', 'level3']
+        aliases: []
+    svc_graph:
+        description:
+            - distinguished name of the service graph. The service graph is an
+              image that shows the relationship between contracts and subjects.
+              Not yet supported.
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the contract subject
+        required: true
+        default: null
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC (resolvable by Ansible control host)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol to use for NX-API
+        required: false
+        default: http
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure subject exists
+  aci_contract_subject:
+    name: web-subject
+    contract: web-contract
+    filters: "{{ filter1 }}"
+    tenant: customer_1
+    state: present
+    host: "{{ inventory_hostname }}"
+    apply_both_directions: true
+    descr: 'subj description'
+
+# ensure contract subject does not exist
+- aci_contract_subject: name=web-subject contract=web-contract tenant=customer_1 state=absent host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+'''
+
+
+import socket
+from cobra.mit.access import MoDirectory
+from cobra.mit.session import LoginSession
+from cobra.mit.request import ConfigRequest
+from cobra.model.vz import Subj
+from cobra.model.vz import InTerm
+from cobra.model.vz import OutTerm
+from cobra.model.vz import RsSubjFiltAtt
+from cobra.model.vz import RsFiltAtt
+from cobra.mit.request import DnQuery
+from cobra.internal.codec.xmlcodec import toXMLStr
+
+
+def get_existing(moDir, subj_mo, proposed_filters, tenant, contract, name):
+
+    ex_in_filters = []
+    ex_out_filters = []
+    ex_filters = []
+
+    ex_prio = None
+    ex_descr = None
+    ex_rev_filter_ports = None
+
+    if subj_mo:
+        ex_prio = subj_mo.prio
+        ex_descr = subj_mo.descr
+        ex_rev_filter_ports = True if subj_mo.revFltPorts == 'yes' else False
+
+    existing = dict(descr=ex_descr, prio=ex_prio, revFltPorts=ex_rev_filter_ports)
+
+    ex_apply_both_dirs = True
+
+    uri = 'uni/tn-{0}/brc-{1}/subj-{2}'
+    dnq = DnQuery(uri.format(tenant, contract, name))
+    dnq.queryTarget = 'children'
+    subj_children = moDir.query(dnq)
+    rns = [str(each.rn) for each in subj_children]
+
+    if 'intmnl' in rns:
+        ex_apply_both_dirs = False
+
+        uri = 'uni/tn-{0}/brc-{1}/subj-{2}/intmnl'
+        ex_in_filters = get_existing_filters(moDir, uri, tenant, contract, name)
+
+        uri = 'uni/tn-{0}/brc-{1}/subj-{2}/outtmnl'
+        ex_out_filters = get_existing_filters(moDir, uri, tenant, contract, name)
+
+    else:
+        uri = 'uni/tn-{0}/brc-{1}/subj-{2}'
+        ex_filters = get_existing_filters(moDir, uri, tenant, contract, name)
+
+    existing_filters = dict(filters=ex_filters, in_filters=ex_in_filters, out_filters=ex_out_filters)
+    existing['apply_both_directions'] = ex_apply_both_dirs
+
+    return existing, existing_filters
+
+
+def get_existing_filters(moDir, uri, tenant, contract, subject):
+
+    existing_filters = []
+    dnq = DnQuery(uri.format(tenant, contract, subject))
+    dnq.queryTarget = 'children'
+    subj_children = moDir.query(dnq)
+
+    for each in subj_children:
+        existing_filters = [each.tnVzFilterName for each in subj_children if each.tCl == 'vzFilter']
+
+    return existing_filters
+
+
+def allowed_filters(moDir, proposed_filters, tenant):
+    # creating a list of possible filters that can be used
+    # includes filters from two tenants: common and the one passed in to the module
+    filter_objects = moDir.lookupByClass('vzFilter')
+    allowed_filters = [str(each.name) for each in filter_objects if 'common' in str(each.dn) or tenant in str(each.dn)]
+
+    # checking proposed filters against allowed filters
+    # to determine if the proposed needs to be configured first
+    for type_filter, filters in proposed_filters.iteritems():
+        for prop in filters:
+            if prop not in allowed_filters:
+                return True, prop
+    return False, None
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            contract=dict(type='str', required=True),
+            tenant=dict(type='str', required=True),
+            descr=dict(type='str'),
+            prio=dict(choices=['unspecified', 'level1', 'level2', 'level3']),
+            apply_both_directions=dict(choices=BOOLEANS, type='bool',
+                                       default=True),
+            reverse_filter_ports=dict(choices=BOOLEANS, type='bool'),
+            filters=dict(type='list'),
+            in_filters=dict(type='list'),
+            out_filters=dict(type='list'),
+            svc_graph=dict(type='str'),
+            state=dict(choices=['present', 'absent'], default=True),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    tenant = module.params['tenant']
+    contract = module.params['contract']
+    descr = module.params['descr']
+    apply_both_directions = module.params['apply_both_directions']
+    prio = module.params['prio']
+    reverse_filter_ports = module.params['reverse_filter_ports']
+    filters = module.params['filters']
+    in_filters = module.params['in_filters']
+    out_filters = module.params['out_filters']
+    svc_graph = module.params['svc_graph']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    tenant_mo = moDir.lookupByDn('uni/tn-{0}'.format(tenant))
+
+    if not tenant_mo:
+        module.fail_json(msg='tenant needs to be created first')
+
+    con_mo = moDir.lookupByDn('uni/tn-{0}/brc-{1}'.format(tenant, contract))
+    if not con_mo:
+        module.fail_json(msg='contract needs to be created first')
+
+    if svc_graph:
+        module.fail_json(msg='service graphs not supported yet in this module')
+
+    if apply_both_directions:
+        if in_filters or out_filters:
+            module.fail_json(msg='in_filters and out_filters only to be used\n' +
+                             ' with apply_both_directions=false, you need to\n' +
+                             ' use param filters')
+    if apply_both_directions is False and reverse_filter_ports:
+        module.fail_json(msg='when apply_both_directions=false, \n ' +
+                         ' reverse_filter_ports must be false or null')
+
+    subj_mo = moDir.lookupByDn('uni/tn-{0}/brc-{1}/subj-{2}'.format(tenant, contract, name))
+
+    existing = {}
+
+    proposed_filters = {}
+
+    args_filters = dict(filters=filters, in_filters=in_filters, out_filters=out_filters)
+
+    for key, value in args_filters.iteritems():
+        if value:
+            proposed_filters[key] = value
+
+    # if the exact subject already exists...otherwise existing is nada
+    existing_filters = {}
+    if subj_mo:
+
+        not_allowed, prop = allowed_filters(moDir, proposed_filters, tenant)
+        if not_allowed:
+            module.fail_json(msg='proposed filter needs to be configured first', filter=prop)
+
+        existing, existing_filters = get_existing(moDir, subj_mo, proposed_filters, tenant, contract, name)
+
+        if existing['apply_both_directions'] != apply_both_directions:
+            module.fail_json(msg='cannot change directions; subject needs to be removed first')
+
+    args = dict(descr=descr, prio=prio, revFltPorts=reverse_filter_ports,
+                svc_graph=svc_graph)
+
+    proposed = {}
+    for key, value in args.iteritems():
+        if value is not None:
+            proposed[key] = value
+
+    delta = dict(set(proposed.iteritems()).difference(existing.iteritems()))
+
+    new_sub_mo = None
+
+    # gather the filters that are proposed, but do not exist
+    # yet in the subject being managed
+    # delta_filter_check is var to determine if there is at least
+    # one element in any given list to determine if a change is needed
+    delta_filters = {}
+    delta_filter_check = False
+    for type_filter, filter_list in proposed_filters.iteritems():
+        temp_list = existing_filters.get(type_filter) or []
+        if temp_list is not None:
+            delta_filters[type_filter] = list(set(filter_list) - set(temp_list))
+            if delta_filters[type_filter]:
+                delta_filter_check = True
+
+    if state == 'present':
+        if delta or (not existing) or delta_filter_check:
+            sub_args = {}
+            for key, value in delta.iteritems():
+                sub_args[key] = value
+
+            # issue with committing this as boolean, so converting this to a string
+            # hasn't happened with other api calls, maybe a bug?
+            if sub_args.get('revFltPorts') is not None:
+                sub_args['revFltPorts'] = str(sub_args['revFltPorts']).lower()
+
+            new_sub_mo = Subj(con_mo, name=name, **sub_args) if sub_args else Subj(con_mo, name=name)
+
+            if delta_filter_check:
+                for type_filter, filter_list in delta_filters.iteritems():
+                    if type_filter == 'filters':
+                        for each in filter_list:
+                            RsSubjFiltAtt(new_sub_mo, tnVzFilterName=each)
+                    elif type_filter == 'in_filters':
+                        vzInTerm = InTerm(new_sub_mo)
+                        for each in filter_list:
+                            vzRsFiltAtt = RsFiltAtt(vzInTerm, tnVzFilterName=each)
+
+                    elif type_filter == 'out_filters':
+                        vzOutTerm = OutTerm(new_sub_mo)
+                        for each in filter_list:
+                            vzRsFiltAtt = RsFiltAtt(vzOutTerm, tnVzFilterName=each)
+
+    elif state == 'absent':
+        if existing:
+            new_sub_mo = Subj(con_mo, name=name)
+            new_sub_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_sub_mo:
+        xmldoc = toXMLStr(new_sub_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_sub_mo)
+            moDir.commit(config_req)
+            existing, existing_filters = get_existing(moDir, subj_mo, proposed_filters, tenant, contract, name)
+            existing['existing_filters'] = existing_filters
+            results['new'] = existing
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

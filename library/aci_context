@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+
+# Copyright 2015 Jason Edelman <jedelman8@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_context
+short_description: Manage private networks, contexts, in an ACI fabric
+description:
+    - Offers ability to manage private networks. Each
+      context is a private network associated to a tenant
+author: Jason Edelman (@jedelman8)
+requirements:
+    - check version requirements ==============================================
+    - Cobra SDK version =======================================================
+notes:
+    - Tenant must be exist prior to using this module
+options:
+    name:
+        description:
+            - Name of context (private network)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of context (private network)
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    tenant:
+        description:
+            - name of tenant the private network will be associated to
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the feature
+        required: true
+        default: null
+        choices: ['present','absent']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC (resolvable by Ansible control host)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol to use for NX-API
+        required: false
+        default: http
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure context for tenant exists (private network)
+- aci_context: name=c1_priv_network descr='customer 1 VRF' tenant=customer_1 state=present host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+# ensure context for tenant does not exist
+- aci_context: name=c1_priv_network tenant=customer_1 state=absent host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+'''
+import socket
+
+from cobra.mit.access import MoDirectory
+from cobra.mit.session import LoginSession
+from cobra.mit.request import ConfigRequest
+from cobra.model.fv import Tenant
+from cobra.model.fv import Ctx
+from cobra.internal.codec.xmlcodec import toXMLStr
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            tenant=dict(type='str', required=True),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], required=True),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    tenant = module.params['tenant']
+    descr = module.params['descr']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    uniMo = moDir.lookupByDn('uni')
+    tenant_filter = 'eq(fvTenant.name, "{0}" )'.format(tenant)
+    tenant_obj_list = moDir.lookupByClass('fvTenant', propFilter=tenant_filter)
+    ten = tenant_obj_list[0] if tenant_obj_list else None
+
+    context_mo = None
+    if ten:
+        fvTenantMo = Tenant(uniMo, tenant)
+        context_mo = moDir.lookupByDn('uni/tn-{0}/ctx-{1}'.format(tenant, name))
+    else:
+        module.fail_json(msg='tenant needs to be created first.')
+
+    ex_con_name = None
+    ex_con_descr = None
+    existing = {}
+    if context_mo:
+        ex_con_name = context_mo.name
+        ex_con_descr = context_mo.descr
+        if not ex_con_descr:
+            ex_con_descr = None
+        existing = dict(name=ex_con_name, descr=ex_con_descr)
+
+    proposed = dict(name=name, descr=descr)
+
+    new_con_mo = None
+    if state == 'present':
+        if context_mo is None or (descr != ex_con_descr and descr is not None):
+            new_con_mo = Ctx(fvTenantMo, name=name, descr=descr) if descr else Ctx(fvTenantMo, name=name)
+
+    elif state == 'absent':
+        if ten:
+            new_con_mo = Ctx(fvTenantMo, name=name)
+            new_con_mo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if new_con_mo:
+        xmldoc = toXMLStr(new_con_mo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            config_req = ConfigRequest()
+            config_req.addMo(new_con_mo)
+            moDir.commit(config_req)
+
+            context_mo = moDir.lookupByDn('uni/tn-{0}/ctx-{1}'.format(tenant, name))
+            if context_mo:
+                ex_con_name = context_mo.name
+                ex_con_descr = context_mo.descr
+                results['new'] = dict(name=ex_con_name, descr=ex_con_descr)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()

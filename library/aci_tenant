@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+
+# Copyright 2015 Jason Edelman <jedelman8@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+
+module: aci_tenant
+short_description: Manage tenants in an ACI fabric
+description:
+    - Offers ability to manage tenants
+author: Jason Edelman (@jedelman8)
+requirements:
+    - check version requirements ==============================================
+    - Cobra SDK version =======================================================
+options:
+    name:
+        description:
+            - Name of tenant
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    descr:
+        description:
+            - description of tenant
+        required: false
+        default: null
+        choices: []
+        aliases: []
+    state:
+        description:
+            - Desired state of the tenant
+        required: true
+        default: null
+        choices: ['enabled','disabled']
+        aliases: []
+    host:
+        description:
+            - IP Address or hostname of APIC (resolvable by Ansible control host)
+        required: true
+        default: null
+        choices: []
+        aliases: []
+    username:
+        description:
+            - Username used to login to the switch
+        required: true
+        default: 'admin'
+        choices: []
+        aliases: []
+    password:
+        description:
+            - Password used to login to the switch
+        required: true
+        default: 'C1sco12345'
+        choices: []
+        aliases: []
+    protocol:
+        description:
+            - Dictates connection protocol to use for NX-API
+        required: false
+        default: http
+        choices: ['http', 'https']
+        aliases: []
+'''
+
+EXAMPLES = '''
+# ensure tenant exists
+- aci_tenant: name=customer_1 descr='tenant by Ansible' state=present host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+# ensure tenant does not exist on system
+- aci_tenant: name=customer_1 state=absent host={{ inventory_hostname }} username={{ user }} password={{ pass }}
+
+'''
+
+import socket
+from cobra.mit.access import MoDirectory
+from cobra.mit.session import LoginSession
+from cobra.mit.request import ConfigRequest
+from cobra.model.fv import Tenant
+from cobra.internal.codec.xmlcodec import toXMLStr
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            name=dict(type='str', required=True),
+            descr=dict(type='str'),
+            state=dict(choices=['present', 'absent'], required=True),
+            host=dict(required=True),
+            username=dict(type='str', default='admin'),
+            password=dict(type='str', default='C1sco12345'),
+            protocol=dict(choices=['http', 'https'], default='https')
+        ),
+        supports_check_mode=True
+    )
+
+    username = module.params['username']
+    password = module.params['password']
+    protocol = module.params['protocol']
+    host = socket.gethostbyname(module.params['host'])
+
+    state = module.params['state'].lower()
+
+    name = module.params['name']
+    descr = module.params['descr']
+
+    apic = '{0}://{1}/'.format(protocol, host)
+
+    session = LoginSession(apic, username, password)
+    moDir = MoDirectory(session)
+    moDir.login()
+
+    uniMo = moDir.lookupByDn('uni')
+
+    tenant_filter = 'eq(fvTenant.name, "{0}" )'.format(name)
+    tenant_obj_list = moDir.lookupByClass('fvTenant', propFilter=tenant_filter)
+    ten = tenant_obj_list[0] if tenant_obj_list else None
+
+    existing = {}
+    if ten:
+        ex_ten_descr = ten.descr
+        if not ex_ten_descr:
+            ex_ten_descr = None
+        existing = dict(name=ten.name, descr=ex_ten_descr)
+    proposed = dict(name=name, descr=descr)
+
+    fvTenantMo = None
+
+    if state == 'present':
+        if ten is None or (descr != ex_ten_descr and descr is not None):
+            fvTenantMo = Tenant(uniMo, name=name, descr=descr) if descr else Tenant(uniMo, name)
+
+    elif state == 'absent':
+        if ten:
+            fvTenantMo = Tenant(uniMo, name)
+            fvTenantMo.delete()
+
+    changed = False
+    results = {}
+    xmldoc = ''
+    if fvTenantMo:
+        xmldoc = toXMLStr(fvTenantMo)
+        if module.check_mode:
+            module.exit_json(changed=True, xmldoc=xmldoc)
+        else:
+            changed = True
+            tenantCfg = ConfigRequest()
+            tenantCfg.addMo(fvTenantMo)
+            moDir.commit(tenantCfg)
+
+            tenant_obj_list = moDir.lookupByClass('fvTenant', propFilter=tenant_filter)
+            ten = tenant_obj_list[0] if tenant_obj_list else None
+            if ten:
+                results['new'] = dict(name=ten.name, descr=ten.descr)
+
+    results['proposed'] = proposed
+    results['existing'] = existing
+    results['state'] = state
+    results['xmldoc'] = xmldoc
+    results['changed'] = changed
+
+    module.exit_json(**results)
+
+from ansible.module_utils.basic import *
+main()
